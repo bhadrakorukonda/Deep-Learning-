@@ -1,0 +1,68 @@
+# -------------------------
+# Python / Deep Learning
+# -------------------------
+
+# Virtual environments
+venv/
+.env/
+.venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Bytecode and compiled
+*.so
+*.dll
+*.dylib
+
+# Data files
+*.csv
+*.tsv
+*.h5
+*.npz
+*.npy
+*.pickle
+*.pkl
+*.json
+
+# Large training data folders
+data/
+datasets/
+input/
+outputs/
+
+# Model checkpoints / weights
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.bin
+*.pb
+*.hdf5
+
+# Logs
+logs/
+*.log
+events.out.tfevents.*
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Spyder / VSCode
+.vscode/
+.spyproject/
+
+# IDEs / OS-specific
+.idea/
+.DS_Store
+Thumbs.db
+
+# CUDA build files
+build/
+dist/
+*.egg-info/
