@@ -33,115 +33,75 @@ from skimage.metrics import structural_similarity as ssim_metric
 from skimage.metrics import peak_signal_noise_ratio as psnr_metric
 
 
-# Device selection: automatically use CUDA if available
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
 ########################################
-# Model: U-Net implementation
+# Model definition
 ########################################
-
-
 class DoubleConv(nn.Module):
-    """Two consecutive conv layers with BatchNorm and ReLU.
-
-    Reusable building block for the U-Net encoder/decoder.
-    """
-
-    def __init__(self, in_ch: int, out_ch: int):
+    """Two consecutive conv layers with BatchNorm and ReLU."""
+    def __init__(self, in_ch, out_ch):
         super().__init__()
         self.double_conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
         )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return self.double_conv(x)
 
-
 class UNet(nn.Module):
-    """Simple U-Net mapping grayscale (1 channel) -> RGB (3 channels).
-
-    The architecture mirrors the original script: a few encoder blocks, a
-    bottleneck, and symmetric decoder blocks with transpose convolutions.
-    Output uses a `sigmoid` to constrain values to [0, 1].
-    """
-
-    def __init__(self, in_channels: int = 1, out_channels: int = 3, features=(64, 128, 256)):
+    """U-Net for 1-channel grayscale to 3-channel RGB colorization."""
+    def __init__(self, in_channels=1, out_channels=3, features=(64, 128, 256)):
         super().__init__()
         self.encs = nn.ModuleList()
         self.pools = nn.ModuleList()
         for f in features:
             self.encs.append(DoubleConv(in_channels, f))
-            self.pools.append(nn.MaxPool2d(kernel_size=2, stride=2))
+            self.pools.append(nn.MaxPool2d(2, 2))
             in_channels = f
-
-        # Bottleneck
-        self.bottleneck = DoubleConv(features[-1], features[-1] * 2)
-
-        # Decoder (upsampling)
+        self.bottleneck = DoubleConv(features[-1], features[-1]*2)
         rev_features = list(reversed(features))
         self.upconvs = nn.ModuleList()
         self.decs = nn.ModuleList()
-        in_ch = features[-1] * 2
+        in_ch = features[-1]*2
         for f in rev_features:
-            self.upconvs.append(nn.ConvTranspose2d(in_ch, f, kernel_size=2, stride=2))
-            # After concatenation, channel dim = skip_channels + upconv_channels
+            self.upconvs.append(nn.ConvTranspose2d(in_ch, f, 2, 2))
             self.decs.append(DoubleConv(in_ch, f))
             in_ch = f
-
-        self.final_conv = nn.Conv2d(in_ch, out_channels, kernel_size=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.final_conv = nn.Conv2d(in_ch, out_channels, 1)
+    def forward(self, x):
         skips = []
         for enc, pool in zip(self.encs, self.pools):
             x = enc(x)
             skips.append(x)
             x = pool(x)
-
         x = self.bottleneck(x)
-
         for upconv, dec, skip in zip(self.upconvs, self.decs, reversed(skips)):
             x = upconv(x)
-            # If shapes mismatch (unlikely for CIFAR-10 32x32), resize to skip spatial
             if x.shape[2:] != skip.shape[2:]:
                 x = torchvision.transforms.functional.resize(x, size=skip.shape[2:])
             x = torch.cat((skip, x), dim=1)
             x = dec(x)
-
         x = self.final_conv(x)
-        x = torch.sigmoid(x)
-        return x
-
+        return torch.sigmoid(x)
 
 ########################################
-# Dataset wrapper
+# Dataset
 ########################################
-
-
 class CIFAR10Colorization(torch.utils.data.Dataset):
-    """Dataset that returns (grayscale_input, color_target) pairs from CIFAR-10.
-
-    - `grayscale_input` is a 1xHxW tensor in [0,1].
-    - `color_target` is a 3xHxW tensor in [0,1].
-    """
-
-    def __init__(self, root: str, train: bool = True, transform_color=None, transform_gray=None, download: bool = True):
+    """Returns (grayscale_input, color_target) pairs from CIFAR-10."""
+    def __init__(self, root, train=True, transform_color=None, transform_gray=None, download=True):
         self.dataset = CIFAR10(root=root, train=train, download=download)
         self.transform_color = transform_color or transforms.ToTensor()
         self.transform_gray = transform_gray or transforms.Compose([
             transforms.Grayscale(num_output_channels=1),
             transforms.ToTensor(),
         ])
-
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.dataset)
-
-    def __getitem__(self, idx: int):
+    def __getitem__(self, idx):
         img, _ = self.dataset[idx]
         color = self.transform_color(img)
         gray = self.transform_gray(img)
@@ -154,25 +114,26 @@ class CIFAR10Colorization(torch.utils.data.Dataset):
 
 
 def compute_metrics_batch(preds: torch.Tensor, targets: torch.Tensor):
-    """Compute average SSIM and PSNR for a batch.
+    """Compute average SSIM and PSNR for a batch of RGB images.
 
-    Both `preds` and `targets` are expected as tensors in [B,3,H,W] with values in [0,1].
-    Returns (avg_ssim, avg_psnr).
+    - Converts (N, C, H, W) tensors to (N, H, W, C) numpy arrays.
+    - Clips values to [0,1].
+    - Uses channel_axis=-1 for SSIM.
+    - Keeps data_range=1.0.
     """
-    preds = preds.detach().cpu().numpy()
-    targets = targets.detach().cpu().numpy()
+    preds_np = preds.detach().cpu().numpy()
+    targets_np = targets.detach().cpu().numpy()
+    preds_np = np.clip(preds_np, 0.0, 1.0)
+    targets_np = np.clip(targets_np, 0.0, 1.0)
+    preds_np = np.transpose(preds_np, (0, 2, 3, 1))
+    targets_np = np.transpose(targets_np, (0, 2, 3, 1))
     batch_ssim = 0.0
     batch_psnr = 0.0
-    b = preds.shape[0]
+    b = preds_np.shape[0]
     for i in range(b):
-        p = np.transpose(preds[i], (1, 2, 0))
-        t = np.transpose(targets[i], (1, 2, 0))
-        p = np.clip(p, 0.0, 1.0)
-        t = np.clip(t, 0.0, 1.0)
-        try:
-            s = ssim_metric(t, p, multichannel=True, data_range=1.0)
-        except TypeError:
-            s = ssim_metric(t, p, data_range=1.0)
+        p = preds_np[i]
+        t = targets_np[i]
+        s = ssim_metric(t, p, data_range=1.0, channel_axis=-1)
         pnr = psnr_metric(t, p, data_range=1.0)
         batch_ssim += s
         batch_psnr += pnr
@@ -272,54 +233,44 @@ def parse_args():
 
 def main():
     args = parse_args()
-
-    # Print selected device so it's clear in logs which hardware is being used.
-    print(f"Using device: {DEVICE}")
-
-    # Prepare dataset transforms and loaders (behavior preserved)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    # Data transforms
     transform_color = transforms.ToTensor()
     transform_gray = transforms.Compose([
         transforms.Grayscale(num_output_channels=1),
         transforms.ToTensor(),
     ])
-
+    # Datasets and loaders
     train_ds = CIFAR10Colorization(root=args.data_dir, train=True, transform_color=transform_color, transform_gray=transform_gray, download=True)
     val_ds = CIFAR10Colorization(root=args.data_dir, train=False, transform_color=transform_color, transform_gray=transform_gray, download=True)
-
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
-
-    # Initialize model, loss, and optimizer (same defaults as before)
-    model = UNet(in_channels=1, out_channels=3).to(DEVICE)
+    # Model, loss, optimizer
+    model = UNet(in_channels=1, out_channels=3).to(device)
     criterion = nn.L1Loss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-
     best_ssim = -1.0
     os.makedirs(args.out_dir, exist_ok=True)
-
     for epoch in range(1, args.epochs + 1):
         print(f"Epoch {epoch}/{args.epochs}")
-        train_loss = train_epoch(model, train_loader, criterion, optimizer, DEVICE)
-        val_loss, val_ssim, val_psnr = validate_epoch(model, val_loader, criterion, DEVICE)
-
-        # Save sample grid from the first validation batch
+        train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
+        val_loss, val_ssim, val_psnr = validate_epoch(model, val_loader, criterion, device)
+        # Save sample grid from first validation batch
         model.eval()
         with torch.no_grad():
             for gray_sample, color_sample in val_loader:
-                gray_sample = gray_sample.to(DEVICE)
-                color_sample = color_sample.to(DEVICE)
+                gray_sample = gray_sample.to(device)
+                color_sample = color_sample.to(device)
                 pred_sample = model(gray_sample)
                 save_sample_grid(gray_sample.cpu(), pred_sample.cpu(), color_sample.cpu(), epoch, args.out_dir, n_samples=args.num_samples)
                 break
-
         print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val SSIM: {val_ssim:.4f} | Val PSNR: {val_psnr:.4f}")
-
-        # Checkpoint best model by SSIM (unchanged behavior)
+        # Save best model by SSIM
         if val_ssim > best_ssim:
             best_ssim = val_ssim
             torch.save(model.state_dict(), args.save_path)
             print(f"Saved best model (SSIM={best_ssim:.4f}) to {args.save_path}")
-
     print("Training complete.")
     print(f"Best validation SSIM: {best_ssim:.4f}")
 
